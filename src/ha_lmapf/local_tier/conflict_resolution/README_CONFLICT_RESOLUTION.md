@@ -1,0 +1,331 @@
+# Conflict Resolution
+
+Agent-agent conflict resolution strategies for the local tier.
+
+## Overview
+
+When two agents want to occupy the same cell, a conflict resolver determines which agent proceeds and which yields.
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                    CONFLICT RESOLUTION                    │
+├───────────────────────────────────────────────────────────┤
+│                                                           │
+│    Agent A wants cell X    Agent B wants cell X           │
+│           │                       │                       │
+│           └───────────┬───────────┘                       │
+│                       ▼                                   │
+│              ┌─────────────────┐                          │
+│              │    RESOLVER     │                          │
+│              │  (Token/PIBT/   │                          │
+│              │   Priority)     │                          │
+│              └─────────────────┘                          │
+│                       │                                   │
+│           ┌───────────┴───────────┐                       │
+│           ▼                       ▼                       │
+│    Agent A: PROCEED        Agent B: WAIT/YIELD            │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
+```
+
+## Files
+
+| File                | Description                       |
+|---------------------|-----------------------------------|
+| `base.py`           | Conflict detection and base class |
+| `token_passing.py`  | Communication-based resolver      |
+| `priority_rules.py` | Communication-free resolver       |
+| `pibt.py`           | Push-based resolver               |
+
+---
+
+## Conflict Types
+
+### Vertex Conflict
+
+Two agents want to be at the same cell at the same timestep.
+
+```
+Time t:     Agent A at (2,2)    Agent B at (2,3)
+Time t+1:   Agent A wants (2,3) Agent B wants (2,3)  ← CONFLICT
+```
+
+### Edge Conflict (Swap)
+
+Two agents want to swap positions.
+
+```
+Time t:     Agent A at (2,2)    Agent B at (2,3)
+Time t+1:   Agent A wants (2,3) Agent B wants (2,2)  ← SWAP CONFLICT
+```
+
+---
+
+## base.py - Conflict Detection
+
+### detect_imminent_conflict Function
+
+```python
+def detect_imminent_conflict(
+        agent_id: int,
+        desired_cell: Cell,
+        sim_state: SimStateView
+) -> Optional[ImminentConflict]:
+    """
+    Detect conflicts for the next step only.
+
+    Checks:
+        1. Vertex conflict: another agent at desired_cell
+        2. Edge conflict: agents swapping positions
+        3. Decided positions: cells already claimed this timestep
+
+    Returns:
+        ImminentConflict with conflict details, or None
+    """
+```
+
+### ImminentConflict Dataclass
+
+```python
+@dataclass(frozen=True)
+class ImminentConflict:
+    kind: str  # "vertex" or "edge"
+    other_agent_id: int  # Conflicting agent
+    cell: Optional[Cell]  # For vertex conflicts
+    edge: Optional[Tuple]  # For edge conflicts
+```
+
+---
+
+## token_passing.py - Token Passing Resolver
+
+Communication-based conflict resolution with fair rotation.
+
+### TokenPassingResolver Class
+
+```python
+class TokenPassingResolver(ConflictResolver):
+    """
+    Token-based conflict resolution.
+
+    Mechanism:
+        - Each contested cell has a "token"
+        - Token holder wins conflicts for that cell
+        - After K conflicts, token rotates (fairness)
+
+    Parameters:
+        fairness_k: int - Conflicts before priority rotation (default: 5)
+    """
+
+    def resolve(
+            self,
+            agent_id: int,
+            desired_cell: Cell,
+            sim_state: SimStateView,
+            observation: Observation,
+            rng=None
+    ) -> StepAction:
+        """
+        Resolve conflict using token ownership.
+
+        Process:
+            1. Detect conflict
+            2. If no conflict: proceed to desired cell
+            3. If conflict: check token ownership
+            4. Winner proceeds, loser yields
+            5. Track conflicts for fairness rotation
+        """
+```
+
+### Fairness Mechanism
+
+```
+After K conflicts between same agents:
+    - Rotate token ownership
+    - Previously disadvantaged agent gets priority
+    - Prevents starvation
+```
+
+### Usage
+
+```python
+from ha_lmapf.local_tier.conflict_resolution import TokenPassingResolver
+
+resolver = TokenPassingResolver(fairness_k=5)
+action = resolver.resolve(agent_id, desired_cell, sim_state, observation)
+```
+
+---
+
+## priority_rules.py - Priority Rules Resolver
+
+Communication-free deterministic resolution.
+
+### PriorityRulesResolver Class
+
+```python
+class PriorityRulesResolver(ConflictResolver):
+    """
+    Deterministic priority-based resolution.
+    No communication required - same rules on all agents.
+
+    Priority Tuple (higher = higher priority):
+        1. urgency = -distance_to_goal, optionally boosted by `boost`
+           when agent's consecutive wait_steps exceed starvation_threshold
+        2. wait_steps: current consecutive wait streak since last move
+        3. -agent_id: lower agent ID wins ties
+
+    Parameters:
+        starvation_threshold: int - Consecutive wait steps before boost (default: 10)
+        boost: int - Urgency boost for starving agents (default: 50)
+    """
+
+    def resolve(
+            self,
+            agent_id: int,
+            desired_cell: Cell,
+            sim_state: SimStateView,
+            observation: Observation,
+            rng=None
+    ) -> StepAction:
+        """
+        Resolve conflict using priority rules.
+
+        Winner: agent with higher priority tuple (uses max())
+        Loser: yields (WAIT or side-step)
+        """
+```
+
+### Priority Calculation
+
+```python
+def priority_tuple(agent):
+    dist = manhattan(agent.pos, agent.goal)
+    urgency = -dist  # negative distance: closer goal → less negative → higher
+    if agent.wait_steps > starvation_threshold:
+        urgency += boost  # starvation boost for currently-blocked agents
+    return (urgency, agent.wait_steps, -agent.agent_id)
+
+# Higher tuple = higher priority (resolver uses max())
+# Example: (-3, 8, -1) beats (-5, 2, 0) because -3 > -5
+# wait_steps is a consecutive-wait streak reset on each successful move
+```
+
+### Usage
+
+```python
+from ha_lmapf.local_tier.conflict_resolution import PriorityRulesResolver
+
+resolver = PriorityRulesResolver(starvation_threshold=10, boost=50)
+action = resolver.resolve(agent_id, desired_cell, sim_state, observation)
+```
+
+---
+
+## pibt.py - PIBT Resolver
+
+Priority Inheritance with Backtracking (simplified).
+
+### PIBTResolver Class
+
+```python
+class PIBTResolver(ConflictResolver):
+    """
+    PIBT-style push-based conflict resolution.
+
+    Mechanism:
+        - Higher priority agent can "push" lower priority agent
+        - Pushed agent must move to a feasible cell
+        - If push not feasible, pusher waits
+
+    Parameters:
+        allow_side_step: bool - Allow side-stepping when blocked
+    """
+
+    def resolve(
+            self,
+            agent_id: int,
+            desired_cell: Cell,
+            sim_state: SimStateView,
+            observation: Observation,
+            rng=None
+    ) -> StepAction:
+        """
+        Resolve conflict using push mechanism.
+
+        Process:
+            1. Detect conflict with other agent
+            2. If higher priority: attempt to push
+            3. If push feasible: proceed
+            4. If push not feasible: wait or side-step
+        """
+```
+
+### Push Feasibility
+
+```
+Push is feasible if:
+    - Pushed agent has adjacent free cell to move to
+    - Pushed agent's movement doesn't cause new conflict
+```
+
+### Usage
+
+```python
+from ha_lmapf.local_tier.conflict_resolution import PIBTResolver
+
+resolver = PIBTResolver(allow_side_step=True)
+action = resolver.resolve(agent_id, desired_cell, sim_state, observation)
+```
+
+---
+
+## Comparison
+
+| Resolver       | Communication | Complexity | Fairness         | Use Case            |
+|----------------|---------------|------------|------------------|---------------------|
+| Token Passing  | Required      | O(1)       | Rotation         | Coordinated systems |
+| Priority Rules | None          | O(1)       | Starvation boost | Independent agents  |
+| PIBT           | None          | O(n)       | Implicit         | Dense environments  |
+
+---
+
+## Configuration
+
+```yaml
+# In config file
+communication_mode: "token"  # Options: "token" or "priority" (set in SimConfig)
+
+# Token passing specific
+fairness_k: 5
+
+# Priority rules specific
+starvation_threshold: 10
+boost: 50
+```
+
+> **Note:** `pibt` is not a valid `communication_mode` in `SimConfig`. The `PIBTResolver`
+> exists in `pibt.py` but must be wired manually; it is not selectable via config.
+
+---
+
+## Sequential Decision-Making
+
+To prevent race conditions during sequential agent decisions:
+
+```python
+# In simulator
+for agent_id in sorted(agents.keys()):
+    action = controllers[agent_id].decide_action(sim_state, obs)
+    next_pos = compute_next_position(agents[agent_id].pos, action)
+    decided_next_positions[agent_id] = next_pos  # Track for later agents
+```
+
+The `decided_next_positions` dict is checked by conflict detection to avoid collisions with already-committed moves.
+
+---
+
+## Related Modules
+
+- [Local Tier](../README_LOCAL_TIER.md) - Uses resolvers in agent controller
+- [Core](../../core/README_CORE.md) - Protocol definitions
